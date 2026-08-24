@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<component name="CastVideoPlayer" extends="Group">
+    <interface>
+        <field id="streamUrl" type="string" value="" alwaysNotify="true" onChange="onStreamUrlChanged" />
+        <field id="streamFormat" type="string" value="mp4" />
+        <field id="playerState" type="string" value="idle" alwaysNotify="true" />
+        <field id="lastError" type="string" value="" alwaysNotify="true" />
+        <field id="failureCount" type="integer" value="0" alwaysNotify="true" />
+        <field id="playbackPosition" type="float" value="0" alwaysNotify="true" />
+        <field id="bufferStatusUpdateCount" type="integer" value="0" alwaysNotify="true" />
+        <field id="underrunCount" type="integer" value="0" alwaysNotify="true" />
+        <field id="startupTime" type="float" value="0" alwaysNotify="true" />
+        <field id="recoveryCount" type="integer" value="0" alwaysNotify="true" />
+        <field id="diagnosticState" type="assocarray" alwaysNotify="true" />
+    </interface>
+    <children>
+        <Video id="streamVideo" width="1920" height="1080" translation="[0,0]" enableUI="false" visible="true" />
+        <Label id="statusLabel" width="1920" height="100" translation="[0,490]" horizAlign="center" vertAlign="center" text="Waiting for Linux sender..." visible="true" />
+    </children>
+    <script type="text/brightscript" uri="pkg:/components/CastVideoPlayer.brs" />
+</component>
