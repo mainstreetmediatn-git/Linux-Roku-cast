@@ -1,11 +1,12 @@
 ' ================================================================
 ' CastVideoPlayer.brs
-' Reconstructed from the locked Milestone 4B-4D design.
+' Milestone 4E: deterministic prebuffer completion + watchdog telemetry
 ' ================================================================
 sub init()
     print "[CAST][VIDEO][INIT] Initializing CastVideoPlayer component..."
     m.video = m.top.findNode("streamVideo")
     m.statusLabel = m.top.findNode("statusLabel")
+    m.prebufferWatchdog = m.top.findNode("prebufferWatchdog")
     m.failureStreak = 0
     m.totalFailures = 0
     m.lastState = "idle"
@@ -20,6 +21,12 @@ sub init()
 
     if m.statusLabel = invalid then
         print "[CAST][VIDEO][WARN] statusLabel node could not be resolved"
+    end if
+
+    if m.prebufferWatchdog = invalid then
+        print "[CAST][VIDEO][WARN] prebuffer watchdog node could not be resolved"
+    else
+        m.prebufferWatchdog.ObserveField("fire", "onPrebufferWatchdogFired")
     end if
 
     m.top.playerState = "idle"
@@ -76,12 +83,15 @@ sub onStreamUrlChanged()
         return
     end if
 
+    stopPrebufferWatchdog()
     m.video.content = content
     m.content = content
     m.recoveryCount = 0
     m.top.recoveryCount = 0
     m.recoveryPending = false
     m.wasUnderrun = false
+    m.lastBufferPercentage = 0
+    m.top.lastBufferPercentage = 0
 
     print "[CAST][VIDEO][CONFIG] ContentNode successfully built and assigned"
     print "[CAST][VIDEO][CONFIG] URL="; streamUrl
@@ -128,7 +138,7 @@ function createVideoContent(streamUrl as String, streamFormat as String) as Obje
 end function
 
 ' ================================================================
-' Milestone 4C: Playback state machine and observers
+' Playback state machine and observers
 ' ================================================================
 sub initObserversAndFlags()
     m.prebufferPlayIssued = false
@@ -158,17 +168,20 @@ sub triggerPrebuffer()
     end if
 
     m.prebufferPlayIssued = false
+    m.lastBufferPercentage = 0
+    m.top.lastBufferPercentage = 0
     attachVideoObservers()
 
     print "[CAST][VIDEO] Initiating background prebuffer..."
     m.top.playerState = "prebuffering"
 
     if m.statusLabel <> invalid then
-        m.statusLabel.text = "Prebuffering stream..."
+        m.statusLabel.text = "Prebuffering stream... 0%"
         m.statusLabel.visible = true
     end if
 
     publishDiagnosticSnapshot()
+    startPrebufferWatchdog()
     m.video.control = "prebuffer"
 end sub
 
@@ -179,8 +192,18 @@ sub onBufferingStatusChanged()
     end if
 
     buffStatus as Dynamic = m.video.bufferingStatus
+
+    ' Roku documents bufferingStatus becoming invalid when buffering is complete.
+    ' Treat that transition as authoritative completion if play has not already
+    ' been issued. This prevents a permanent prebuffer screen when the final
+    ' prebufferDone=true associative-array update is coalesced or missed.
     if buffStatus = invalid then
-        print "[CAST][VIDEO][BUFFER] bufferingStatus invalid/complete"
+        print "[CAST][VIDEO][BUFFER] bufferingStatus invalid: buffering complete"
+        if m.top.playerState = "prebuffering" and m.prebufferPlayIssued <> true then
+            m.prebufferPlayIssued = true
+            print "[CAST][VIDEO][BUFFER] completion inferred from invalid bufferingStatus"
+            startPlayback()
+        end if
         return
     end if
 
@@ -193,7 +216,12 @@ sub onBufferingStatusChanged()
     m.top.bufferStatusUpdateCount = m.bufferStatusUpdateCount
 
     if buffStatus.DoesExist("percentage") then
-        print "[CAST][VIDEO][BUFFER] percent="; buffStatus.percentage
+        m.lastBufferPercentage = buffStatus.percentage
+        m.top.lastBufferPercentage = m.lastBufferPercentage
+        print "[CAST][VIDEO][BUFFER] percent="; m.lastBufferPercentage
+        if m.statusLabel <> invalid then
+            m.statusLabel.text = "Prebuffering stream... " + m.lastBufferPercentage.ToStr() + "%"
+        end if
     end if
 
     currentUnderrun as Boolean = false
@@ -214,6 +242,7 @@ sub onBufferingStatusChanged()
             m.prebufferPlayIssued = true
             print "[CAST][VIDEO][BUFFER] prebuffer complete"
             startPlayback()
+            return
         end if
     end if
 
@@ -226,6 +255,7 @@ sub startPlayback()
         return
     end if
 
+    stopPrebufferWatchdog()
     print "[CAST][VIDEO][PLAY] issuing play command"
     m.top.playerState = "play_requested"
     publishDiagnosticSnapshot()
@@ -243,6 +273,7 @@ sub onVideoStateChanged()
     print "[CAST][VIDEO][STATE] "; currentState
 
     if currentState = "playing" then
+        stopPrebufferWatchdog()
         m.top.playerState = "playing"
         m.failureStreak = 0
         m.recoveryPending = false
@@ -270,9 +301,11 @@ sub onVideoStateChanged()
         end if
 
     else if currentState = "finished" then
+        stopPrebufferWatchdog()
         m.top.playerState = "finished"
 
     else if currentState = "error" then
+        stopPrebufferWatchdog()
         handlePlaybackError()
         return
     end if
@@ -327,6 +360,51 @@ sub onPositionChanged()
     m.top.playbackPosition = m.video.position
 end sub
 
+' ================================================================
+' Prebuffer watchdog
+' ================================================================
+sub startPrebufferWatchdog()
+    if m.prebufferWatchdog = invalid then return
+    m.prebufferWatchdog.control = "stop"
+    m.prebufferWatchdog.control = "start"
+end sub
+
+sub stopPrebufferWatchdog()
+    if m.prebufferWatchdog = invalid then return
+    m.prebufferWatchdog.control = "stop"
+end sub
+
+sub onPrebufferWatchdogFired()
+    if m.top.playerState <> "prebuffering" then return
+    if m.prebufferPlayIssued = true then return
+
+    m.prebufferTimeoutCount = m.prebufferTimeoutCount + 1
+    m.top.prebufferTimeoutCount = m.prebufferTimeoutCount
+
+    print "[CAST][VIDEO][WATCHDOG] prebuffer timeout percent="; m.lastBufferPercentage
+
+    ' Known Roku behavior can occasionally stall at ~99% even though the
+    ' decoder has enough media to start. A single guarded play attempt is safer
+    ' than leaving the receiver permanently stuck on the prebuffer screen.
+    if m.lastBufferPercentage >= 95 then
+        m.prebufferPlayIssued = true
+        print "[CAST][VIDEO][WATCHDOG] high-water fallback: issuing play"
+        startPlayback()
+        return
+    end if
+
+    reason as String = "PREBUFFER_STALLED_" + m.lastBufferPercentage.ToStr() + "_PERCENT"
+    recordFailure(reason, false)
+    publishDiagnosticSnapshot()
+
+    if canAttemptRecovery() then
+        attemptRecovery()
+    else
+        m.top.playerState = "recovery_exhausted"
+        publishDiagnosticSnapshot()
+    end if
+end sub
+
 sub recordFailure(failureReason as String, preserveLastError as Boolean)
     m.failureStreak = m.failureStreak + 1
     m.totalFailures = m.totalFailures + 1
@@ -346,7 +424,7 @@ sub recordFailure(failureReason as String, preserveLastError as Boolean)
 end sub
 
 ' ================================================================
-' Milestone 4D: diagnostics, metrics, bounded recovery
+' Diagnostics, metrics, bounded recovery
 ' ================================================================
 sub initDiagnosticsAndRecovery()
     m.underrunCount = 0
@@ -355,6 +433,8 @@ sub initDiagnosticsAndRecovery()
     m.maxRecoveries = 3
     m.recoveryPending = false
     m.wasUnderrun = false
+    m.lastBufferPercentage = 0
+    m.prebufferTimeoutCount = 0
 end sub
 
 function classifyPlaybackError(errorInfo as Dynamic, errorCode as Integer) as String
@@ -382,6 +462,8 @@ sub publishDiagnosticSnapshot()
         failureStreak: m.failureStreak
         underruns: m.underrunCount
         bufferStatusUpdates: m.bufferStatusUpdateCount
+        lastBufferPercentage: m.lastBufferPercentage
+        prebufferTimeouts: m.prebufferTimeoutCount
         startupTime: m.top.startupTime
         recoveryCount: m.recoveryCount
         lastError: m.top.lastError
@@ -395,6 +477,8 @@ function canAttemptRecovery() as Boolean
 end function
 
 sub attemptRecovery()
+    stopPrebufferWatchdog()
+
     if canAttemptRecovery() = false then
         print "[CAST][VIDEO][RECOVERY] Circuit open. Max automatic recoveries reached."
         m.top.playerState = "recovery_exhausted"
