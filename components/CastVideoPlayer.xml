@@ -11,10 +11,13 @@
         <field id="underrunCount" type="integer" value="0" alwaysNotify="true" />
         <field id="startupTime" type="float" value="0" alwaysNotify="true" />
         <field id="recoveryCount" type="integer" value="0" alwaysNotify="true" />
+        <field id="lastBufferPercentage" type="integer" value="0" alwaysNotify="true" />
+        <field id="prebufferTimeoutCount" type="integer" value="0" alwaysNotify="true" />
         <field id="diagnosticState" type="assocarray" alwaysNotify="true" />
     </interface>
     <children>
         <Video id="streamVideo" width="1920" height="1080" translation="[0,0]" enableUI="false" visible="true" />
+        <Timer id="prebufferWatchdog" repeat="false" duration="8" />
         <Label id="statusLabel" width="1920" height="100" translation="[0,490]" horizAlign="center" vertAlign="center" text="Waiting for Linux sender..." visible="true" />
     </children>
     <script type="text/brightscript" uri="pkg:/components/CastVideoPlayer.brs" />
